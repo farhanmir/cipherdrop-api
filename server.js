@@ -47,10 +47,15 @@ async function saveSecrets(secrets) {
 
 // POST /api/secrets: Create a new burn-after-reading secret
 app.post('/api/secrets', async (req, res) => {
-  const { secret, ttlMinutes } = req.body;
+  let { secret, ttlMinutes } = req.body;
 
-  if (!secret || typeof ttlMinutes !== 'number' || ttlMinutes <= 0) {
-    return res.status(400).json({ error: 'Valid secret and ttlMinutes required' });
+  // Provide a default TTL if missing (backward compatibility with simple clients)
+  if (typeof ttlMinutes !== 'number' || ttlMinutes <= 0) {
+    ttlMinutes = 60; 
+  }
+
+  if (!secret) {
+    return res.status(400).json({ error: 'Secret is required' });
   }
 
   const id = crypto.randomUUID();
