@@ -4,7 +4,7 @@ const crypto = require('node:crypto');
 
 const app = express();
 
-const PORT = 3000;
+const PORT = Number(process.env.PORT) || 3000;
 const GC_INTERVAL_MS = 60 * 1000;
 const MAX_SECRET_BYTES = 64 * 1024;
 const MIN_TTL_MINUTES = 1;
