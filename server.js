@@ -1,137 +1,194 @@
-require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
-const crypto = require('crypto');
-const fs = require('fs').promises;
-const path = require('path');
+const crypto = require('node:crypto');
 
 const app = express();
+
+const PORT = 3000;
+const GC_INTERVAL_MS = 60 * 1000;
+const MAX_SECRET_BYTES = 64 * 1024;
+const MIN_TTL_MINUTES = 1;
+const MAX_TTL_MINUTES = 24 * 60;
+const BOOT_TIME_MS = Date.now();
+
+// Ephemeral in-memory state (resets on process restart).
+const secretsStore = new Map();
+const SERVER_KEY = crypto.randomBytes(32);
+const metrics = {
+  created: 0,
+  readSuccess: 0,
+  notFoundOrExpired: 0,
+  decryptFailures: 0,
+  gcDeleted: 0
+};
+
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '100kb' }));
 
-// Configuration
-const DATA_DIR = path.join(__dirname, 'data');
-const SECRETS_FILE = path.join(DATA_DIR, 'secrets.json');
-const SERVER_KEY_HEX = process.env.CIPHERDROP_SERVER_KEY;
+app.use((req, res, next) => {
+  res.setHeader('X-Request-Id', crypto.randomUUID());
+  next();
+});
 
-// Securely load the server key
-if (!SERVER_KEY_HEX || SERVER_KEY_HEX.length !== 64) {
-  console.error('CRITICAL ERROR: CIPHERDROP_SERVER_KEY (32-byte hex) is missing or invalid.');
-  process.exit(1);
+function isExpired(expiresAt, now = Date.now()) {
+  return now >= expiresAt;
 }
-const SERVER_KEY = Buffer.from(SERVER_KEY_HEX, 'hex');
 
-// Helper: Ensure the data store exists
-async function initDb() {
-  try {
-    await fs.mkdir(DATA_DIR, { recursive: true });
-    try {
-      await fs.access(SECRETS_FILE);
-    } catch {
-      await fs.writeFile(SECRETS_FILE, JSON.stringify({}));
+function cleanupExpiredSecrets(now = Date.now()) {
+  let deletedCount = 0;
+
+  for (const [id, entry] of secretsStore.entries()) {
+    if (isExpired(entry.expiresAt, now)) {
+      secretsStore.delete(id);
+      deletedCount += 1;
     }
-  } catch (err) {
-    console.error('Database initialization error:', err);
-  }
-}
-
-// Helper: Read and lock/write could be simplified for this scale
-async function getSecrets() {
-  const data = await fs.readFile(SECRETS_FILE, 'utf8');
-  return JSON.parse(data);
-}
-
-async function saveSecrets(secrets) {
-  await fs.writeFile(SECRETS_FILE, JSON.stringify(secrets, null, 2));
-}
-
-// POST /api/secrets: Create a new burn-after-reading secret
-app.post('/api/secrets', async (req, res) => {
-  let { secret, ttlMinutes } = req.body;
-
-  // Provide a default TTL if missing (backward compatibility with simple clients)
-  if (typeof ttlMinutes !== 'number' || ttlMinutes <= 0) {
-    ttlMinutes = 60; 
   }
 
-  if (!secret) {
-    return res.status(400).json({ error: 'Secret is required' });
+  return deletedCount;
+}
+
+function encryptSecret(plaintext, iv) {
+  const cipher = crypto.createCipheriv('aes-256-ctr', SERVER_KEY, iv);
+  return Buffer.concat([cipher.update(plaintext, 'utf8'), cipher.final()]);
+}
+
+function decryptSecret(ciphertextHex, ivHex) {
+  const decipher = crypto.createDecipheriv(
+    'aes-256-ctr',
+    SERVER_KEY,
+    Buffer.from(ivHex, 'hex')
+  );
+
+  return Buffer.concat([
+    decipher.update(Buffer.from(ciphertextHex, 'hex')),
+    decipher.final()
+  ]).toString('utf8');
+}
+
+function parseAndValidateCreateSecretRequest(body) {
+  const secret = body?.secret;
+  const ttlMinutes = body?.ttlMinutes;
+
+  if (typeof secret !== 'string' || secret.length === 0) {
+    return { error: 'secret must be a non-empty string' };
+  }
+
+  const secretByteLength = Buffer.byteLength(secret, 'utf8');
+  if (secretByteLength > MAX_SECRET_BYTES) {
+    return { error: `secret must be <= ${MAX_SECRET_BYTES} bytes` };
+  }
+
+  if (!Number.isInteger(ttlMinutes)) {
+    return { error: 'ttlMinutes must be an integer' };
+  }
+
+  if (ttlMinutes < MIN_TTL_MINUTES || ttlMinutes > MAX_TTL_MINUTES) {
+    return {
+      error: `ttlMinutes must be between ${MIN_TTL_MINUTES} and ${MAX_TTL_MINUTES}`
+    };
+  }
+
+  return { secret, ttlMinutes };
+}
+
+app.post('/api/secrets', (req, res) => {
+  const parsed = parseAndValidateCreateSecretRequest(req.body);
+  if (parsed.error) {
+    return res.status(400).json({ error: parsed.error });
   }
 
   const id = crypto.randomUUID();
   const iv = crypto.randomBytes(16);
-  
-  // Encrypt the secret
-  const cipher = crypto.createCipheriv('aes-256-ctr', SERVER_KEY, iv);
-  const encrypted = Buffer.concat([cipher.update(secret, 'utf8'), cipher.final()]);
+  const encryptedSecret = encryptSecret(parsed.secret, iv).toString('hex');
+  const expiresAt = Date.now() + parsed.ttlMinutes * 60 * 1000;
 
-  const expiresAt = Date.now() + ttlMinutes * 60 * 1000;
-
-  // Persist to file
-  const secrets = await getSecrets();
-  secrets[id] = {
-    encryptedSecret: encrypted.toString('hex'),
+  secretsStore.set(id, {
+    encryptedSecret,
     iv: iv.toString('hex'),
-    expiresAt
-  };
-  await saveSecrets(secrets);
+    expiresAt,
+    createdAt: Date.now()
+  });
+  metrics.created += 1;
 
-  res.status(201).json({ id });
+  return res.status(201).json({ id });
 });
 
-// GET /api/secrets/:id: Read and burn a secret
-app.get('/api/secrets/:id', async (req, res) => {
+app.get('/api/secrets/:id', (req, res) => {
   const { id } = req.params;
-  const secrets = await getSecrets();
-  const data = secrets[id];
+  const record = secretsStore.get(id);
 
-  if (!data || Date.now() > data.expiresAt) {
-    if (data) {
-      delete secrets[id];
-      await saveSecrets(secrets);
+  if (!record || isExpired(record.expiresAt)) {
+    if (record) {
+      secretsStore.delete(id);
     }
+    metrics.notFoundOrExpired += 1;
     return res.status(404).json({ error: 'Secret not found or expired' });
   }
 
-  // Burn on read: Delete immediately
-  delete secrets[id];
-  await saveSecrets(secrets);
+  // Burn-on-read: remove from memory before sending the plaintext response.
+  secretsStore.delete(id);
 
-  // Decrypt the secret
-  const decipher = crypto.createDecipheriv('aes-256-ctr', SERVER_KEY, Buffer.from(data.iv, 'hex'));
-  const decrypted = Buffer.concat([
-    decipher.update(Buffer.from(data.encryptedSecret, 'hex')), 
-    decipher.final()
-  ]);
-
-  res.json({ secret: decrypted.toString('utf8') });
+  try {
+    const secret = decryptSecret(record.encryptedSecret, record.iv);
+    metrics.readSuccess += 1;
+    return res.status(200).json({ secret });
+  } catch {
+    metrics.decryptFailures += 1;
+    return res.status(500).json({ error: 'Failed to decrypt secret' });
+  }
 });
 
-// Periodic Garbage Collection
-setInterval(async () => {
-  try {
-    const secrets = await getSecrets();
-    let changed = false;
-    const now = Date.now();
-    
-    for (const id in secrets) {
-      if (now > secrets[id].expiresAt) {
-        delete secrets[id];
-        changed = true;
-      }
-    }
-
-    if (changed) {
-      await saveSecrets(secrets);
-    }
-  } catch (err) {
-    console.error('Garbage collection error:', err);
-  }
-}, 60 * 1000);
-
-const PORT = process.env.PORT || 3000;
-initDb().then(() => {
-  app.listen(PORT, () => {
-    console.log(`CipherDrop Persistent Server listening on port ${PORT}`);
+app.get('/health', (req, res) => {
+  const now = Date.now();
+  return res.status(200).json({
+    status: 'ok',
+    uptimeSeconds: Math.floor((now - BOOT_TIME_MS) / 1000),
+    inMemorySecrets: secretsStore.size,
+    serverTime: new Date(now).toISOString()
   });
+});
+
+app.get('/metrics', (req, res) => {
+  const now = Date.now();
+  return res.status(200).json({
+    uptimeSeconds: Math.floor((now - BOOT_TIME_MS) / 1000),
+    inMemorySecrets: secretsStore.size,
+    counters: {
+      created: metrics.created,
+      readSuccess: metrics.readSuccess,
+      notFoundOrExpired: metrics.notFoundOrExpired,
+      decryptFailures: metrics.decryptFailures,
+      gcDeleted: metrics.gcDeleted
+    }
+  });
+});
+
+app.use((err, req, res, next) => {
+  if (err instanceof SyntaxError && err.status === 400 && 'body' in err) {
+    return res.status(400).json({ error: 'Invalid JSON body' });
+  }
+
+  return next(err);
+});
+
+app.use((err, req, res, next) => {
+  console.error('Unhandled server error:', err);
+  if (res.headersSent) {
+    return next(err);
+  }
+  return res.status(500).json({ error: 'Internal server error' });
+});
+
+const gcHandle = setInterval(() => {
+  const deletedCount = cleanupExpiredSecrets();
+  if (deletedCount > 0) {
+    metrics.gcDeleted += deletedCount;
+    console.log(`GC removed ${deletedCount} expired secret(s)`);
+  }
+}, GC_INTERVAL_MS);
+
+gcHandle.unref();
+
+app.listen(PORT, () => {
+  console.log(`CipherDrop API listening on port ${PORT}`);
 });
