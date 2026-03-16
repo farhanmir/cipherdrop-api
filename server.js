@@ -23,6 +23,7 @@ const metrics = {
 };
 
 app.use(cors());
+app.options(/.*/, cors());
 app.use(express.json({ limit: '100kb' }));
 
 app.use((req, res, next) => {
